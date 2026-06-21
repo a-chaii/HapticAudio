@@ -13,41 +13,38 @@ import kotlinx.coroutines.channels.Channel
 import kotlin.math.log10
 import kotlin.math.sqrt
 
-/**
- * 实时高保真音频转震动信号处理器 (旋律纹理优化版)
- */
 object AudioProcessor {
-    
-    // 适当加大通道容量，允许保留一小段平滑连贯的音频流
-    private val audioChannel = Channel<Any>(capacity = 4, onBufferOverflow = BufferOverflow.DROP_OLDEST)
+    var intensityMultiplier = 1.0f
+
+    // 核心缓冲区：分离音频提取和震动触发，绝不阻塞音频主线程
+    private val audioChannel = Channel<Any>(capacity = 100, onBufferOverflow = BufferOverflow.DROP_OLDEST)
+    private val waveformChannel = Channel<IntArray>(capacity = 10, onBufferOverflow = BufferOverflow.DROP_OLDEST)
     private val processorScope = CoroutineScope(Dispatchers.Default + SupervisorJob())
 
     private var vibrator: Vibrator? = null
     private var isInitialized = false
 
-    // ==========================================
-    // 核心算法调音台参数 (你可以根据个人喜好微调)
-    // ==========================================
-    
-    // 1. 低通滤波器系数 (1st order IIR LPF)
-    // 0.01 到 0.03 之间。值越小，高频滤得越干净，震动越厚实；值越大，能保留更多中频人声细节。
-    private const val ALPHA = 0.02f 
-    private var lastFilteredSample = 0.0f
-
-    // 2. 触觉包络释放系数 (Envelope Decay)
-    // 核心参数！值越小(如0.05)，震动淡出越慢，余音越长，能把断续的鼓点黏合为连续的丝滑旋律波浪。
-    // 值变大(如0.3)则会变得紧凑清脆。
-    private const val ATTACK = 0.4f   // 能量上升响应速度
-    private const val DECAY = 0.08f   // 能量下降衰减速度
+    // === 一加 0916 Turbo (CSA0916) 专属算法参数 ===
+    // 彻底抛弃低通滤波，保留 50Hz-500Hz 全频段音乐纹理
+    private const val ATTACK = 0.8f   // 极速启动（0916 的 1ms 响应能完美接住瞬态）
+    private const val DECAY = 0.2f    // 适中衰减，把人声和弦乐的余音“黏合”成连续的波浪
     private var currentEnvelope = 0.0f
 
-    // 3. 硬件控制节流
-    // 线性马达物理响应极限大约在 15-20ms 左右，发送过快会产生瞬态硬件噪音。
-    private var lastVibrateTime = 0L
-    private const val MOTOR_UPDATE_INTERVAL_MS = 20L // 限制为最高 50Hz 刷新率
+    // === 流式同步波形批处理 (Stream-Synced Batching) ===
+    // 这是消除“哒哒震”的秘密武器：我们将散落的振幅拼成一整段连续的波形
+    private const val SAMPLES_PER_FRAME = 1024 // 约 11ms 的逻辑帧
+    private const val BATCH_SIZE = 6           // 每次积攒 6 帧 (约 66ms 的连续波段)
+    
+    private val timings = LongArray(BATCH_SIZE) { 11L } // 每一帧的持续时间
+    private val amplitudes = IntArray(BATCH_SIZE)
+    private var batchIndex = 0
+
+    private var currentFrameEnergy = 0.0
+    private var currentFrameSamples = 0
 
     init {
         startProcessing()
+        startVibrating()
     }
 
     fun pushAudioData(data: Any) {
@@ -58,10 +55,8 @@ object AudioProcessor {
     private fun initVibratorIfNeeded() {
         if (isInitialized) return
         val context = AndroidAppHelper.currentApplication()?.applicationContext ?: return
-        
         vibrator = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.S) {
-            val vm = context.getSystemService(Context.VIBRATOR_MANAGER_SERVICE) as VibratorManager
-            vm.defaultVibrator
+            (context.getSystemService(Context.VIBRATOR_MANAGER_SERVICE) as VibratorManager).defaultVibrator
         } else {
             context.getSystemService(Context.VIBRATOR_SERVICE) as Vibrator
         }
@@ -71,101 +66,86 @@ object AudioProcessor {
     private fun startProcessing() {
         processorScope.launch {
             for (data in audioChannel) {
+                processAudioChunk(data)
+            }
+        }
+    }
+
+    private fun startVibrating() {
+        processorScope.launch {
+            for (amps in waveformChannel) {
                 initVibratorIfNeeded()
                 if (vibrator?.hasVibrator() != true) continue
-
-                // 步骤 1: 提取经过低通滤波器的音频信号均方根 (RMS)
-                val rawRms = calculateFilteredRMS(data)
-
-                // 步骤 2: 对数动态范围压缩 (Logarithmic Scaling)
-                // 16-bit PCM 理论最大值为 32768。
-                val normalized = (rawRms / 32768.0).coerceIn(0.0001, 1.0)
-                val dbValue = 20.0 * log10(normalized) // 转换为 dB 量级，范围大约在 -80dB 到 0dB
-                
-                // 映射门限：把 -45dB 到 0dB 映射到 0.0 到 1.0 区间。
-                // 调低门限(-45dB)能拉高副歌和弱音的存在感，让旋律在马达上“浮现”出来
-                val targetIntensity = ((dbValue + 45.0) / 45.0).coerceIn(0.0, 1.0).toFloat()
-
-                // 步骤 3: 经过 Attack/Decay 模拟物理阻尼 (平滑黏合器)
-                if (targetIntensity > currentEnvelope) {
-                    currentEnvelope += ATTACK * (targetIntensity - currentEnvelope)
-                } else {
-                    currentEnvelope += DECAY * (targetIntensity - currentEnvelope) // 缓慢释放，黏合鼓点
-                }
-
-                // 转换为最终马达振幅
-                val finalAmplitude = (currentEnvelope * 255).toInt().coerceIn(0, 255)
-
-                // 步骤 4: 节流控制与首尾衔接
-                val now = System.currentTimeMillis()
-                if (now - lastVibrateTime >= MOTOR_UPDATE_INTERVAL_MS) {
-                    // 过滤底噪，防止没音乐时马达隐隐作痛
-                    if (finalAmplitude > 12) {
-                        triggerVibration(finalAmplitude)
-                    }
-                    lastVibrateTime = now
+                if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
+                    try {
+                        // 提交一整段 66ms 的波形。马达会连贯地起伏，底层不会触发互相 Cancel 的“哒哒”声
+                        val effect = VibrationEffect.createWaveform(timings, amps, -1)
+                        vibrator?.vibrate(effect)
+                    } catch (e: Exception) { }
                 }
             }
         }
     }
 
-    /**
-     * 带一阶 IIR 低通滤波的积分器
-     * 公式：Y(n) = α * X(n) + (1 - α) * Y(n-1)
-     */
-    private fun calculateFilteredRMS(data: Any): Double {
-        var sum = 0.0
-        var count = 0
-
+    private fun processAudioChunk(data: Any) {
         when (data) {
             is ByteArray -> {
                 val size = data.size - 1
                 for (i in 0 until size step 2) {
                     val sample = (data[i].toInt() and 0xFF) or (data[i + 1].toInt() shl 8)
                     val signedSample = (if (sample > 32767) sample - 65536 else sample).toFloat()
-
-                    // 低通滤波核心
-                    lastFilteredSample = ALPHA * signedSample + (1f - ALPHA) * lastFilteredSample
-                    sum += lastFilteredSample * lastFilteredSample
-                    count++
+                    accumulateSample(signedSample)
                 }
             }
             is ShortArray -> {
-                for (sample in data) {
-                    val signedSample = sample.toFloat()
-                    lastFilteredSample = ALPHA * signedSample + (1f - ALPHA) * lastFilteredSample
-                    sum += lastFilteredSample * lastFilteredSample
-                    count++
-                }
+                for (sample in data) { accumulateSample(sample.toFloat()) }
             }
             is FloatArray -> {
-                for (sample in data) {
-                    val scaledSample = sample * 32767f
-                    lastFilteredSample = ALPHA * scaledSample + (1f - ALPHA) * lastFilteredSample
-                    sum += lastFilteredSample * lastFilteredSample
-                    count++
-                }
+                for (sample in data) { accumulateSample(sample * 32767f) }
             }
         }
-
-        if (count == 0) return 0.0
-        return sqrt(sum / count)
     }
 
-    /**
-     * 激发连续波浪震动
-     */
-    private fun triggerVibration(amplitude: Int) {
-        // 关键点：我们将每次震动的时长（duration）设为 35ms，长于我们 20ms 的刷新节流。
-        // 这样下一次更新会直接覆盖并平滑过渡到上一次的震动尾巴，马达内部就不会因为突然彻底停机产生“哒哒”的断点感。
-        val duration = 35L 
+    private fun accumulateSample(sample: Float) {
+        currentFrameEnergy += sample * sample
+        currentFrameSamples++
 
-        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
-            val effect = VibrationEffect.createOneShot(duration, amplitude)
-            vibrator?.vibrate(effect)
-        } else {
-            @Suppress("DEPRECATION")
-            vibrator?.vibrate(duration)
+        // 当积攒够一个逻辑帧 (约11ms)
+        if (currentFrameSamples >= SAMPLES_PER_FRAME) {
+            val rms = sqrt(currentFrameEnergy / SAMPLES_PER_FRAME)
+            amplitudes[batchIndex] = mapRmsToAmplitude(rms)
+            batchIndex++
+
+            currentFrameEnergy = 0.0
+            currentFrameSamples = 0
+
+            // 如果波形数组填满了 (约66ms)
+            if (batchIndex >= BATCH_SIZE) {
+                waveformChannel.trySend(amplitudes.clone()) // 拷贝一份发给震动协程
+                batchIndex = 0
+            }
         }
+    }
+
+    private fun mapRmsToAmplitude(rms: Double): Int {
+        val normalized = (rms / 32768.0).coerceIn(0.0001, 1.0)
+        val dbValue = 20.0 * log10(normalized)
+
+        // 极宽动态映射：把 -50dB 到 0dB 映射到 0.0 ~ 1.0
+        // 这能放过绝大多数人声和弦乐的微小起伏
+        val targetIntensity = ((dbValue + 50.0) / 50.0).coerceIn(0.0, 1.0).toFloat()
+
+        // 包络追踪器：平滑锯齿，塑造连贯波浪
+        if (targetIntensity > currentEnvelope) {
+            currentEnvelope += ATTACK * (targetIntensity - currentEnvelope)
+        } else {
+            currentEnvelope += DECAY * (targetIntensity - currentEnvelope)
+        }
+
+        // 应用来自 Web 端的滑块强度倍率
+        val finalAmp = (currentEnvelope * 255 * intensityMultiplier).toInt().coerceIn(0, 255)
+        
+        // 切除底噪门限（防止没声时隐隐作痛）
+        return if (finalAmp > 8) finalAmp else 0
     }
 }
