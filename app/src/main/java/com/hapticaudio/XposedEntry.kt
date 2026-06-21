@@ -35,7 +35,7 @@ class XposedEntry : IXposedHookLoadPackage {
                 if (now - lastPrefReloadTime > 1000) {
                     pref.reload()
                     isMuted = pref.getBoolean("mute_speaker", true)
-                    AudioProcessor.intensityMultiplier = pref.getInt("intensity", 100) / 100.0f
+                    AudioProcessor.intensityMultiplier = pref.getInt("intensity", 100) 100f / 100f
                     lastPrefReloadTime = now
                 }
 
