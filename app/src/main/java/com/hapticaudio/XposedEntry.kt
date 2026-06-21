@@ -1,85 +1,74 @@
 package com.hapticaudio
 
-import android.media.AudioTrack
-import android.media.audiofx.HapticGenerator
+import android.app.AndroidAppHelper
+import android.content.Intent
 import de.robv.android.xposed.IXposedHookLoadPackage
 import de.robv.android.xposed.XC_MethodHook
 import de.robv.android.xposed.XposedBridge
 import de.robv.android.xposed.XposedHelpers
 import de.robv.android.xposed.XSharedPreferences
 import de.robv.android.xposed.callbacks.XC_LoadPackage
-import java.util.WeakHashMap
 
 class XposedEntry : IXposedHookLoadPackage {
     private var lastPrefReloadTime = 0L
     private var isMuted = true
-    
-    // 使用 WeakHashMap 储存已挂载的特效，防止内存泄漏，且不会重复创建
-    private val hapticGenerators = WeakHashMap<AudioTrack, HapticGenerator>()
+    private var lastBroadcastTime = 0L
 
     override fun handleLoadPackage(lpparam: XC_LoadPackage.LoadPackageParam) {
         if (lpparam.packageName == "android") return
 
         val pref = XSharedPreferences("com.hapticaudio", "haptic_config")
 
-        // 【钩子 1】：在音乐准备开始播放时，把系统的触觉生成器挂载上去
-        XposedHelpers.findAndHookMethod(
-            "android.media.AudioTrack",
-            lpparam.classLoader,
-            "play",
-            object : XC_MethodHook() {
-                override fun afterHookedMethod(param: MethodHookParam) {
-                    val track = param.thisObject as AudioTrack
-                    
-                    // 如果已经挂载过，直接跳过
-                    if (hapticGenerators.containsKey(track)) return
-
-                    try {
-                        // 检查一加系统是否支持原生触觉生成器
-                        if (HapticGenerator.isAvailable()) {
-                            val generator = HapticGenerator.create(track.audioSessionId)
-                            if (generator != null) {
-                                generator.enabled = true
-                                hapticGenerators[track] = generator
-                                XposedBridge.log("HapticAudio: 成功挂载一加底层 HapticGenerator!")
-                            }
-                        } else {
-                            XposedBridge.log("HapticAudio: 警告！该系统不支持原生的 HapticGenerator。")
-                        }
-                    } catch (e: Exception) {
-                        XposedBridge.log("HapticAudio 挂载失败: ${e.message}")
-                    }
-                }
-            }
-        )
-
-        // 【钩子 2】：拦截写入数据的瞬间，实现“偷天换日”的静音
         val writeHook = object : XC_MethodHook() {
             override fun beforeHookedMethod(param: MethodHookParam) {
-                val track = param.thisObject as AudioTrack
+                val audioData = param.args[0] ?: return
+                val offset = param.args[1] as Int
+                val size = param.args[2] as Int
+                val arrayType = audioData.javaClass
 
-                // 限流读取 UI 开关配置
+                // 1. 发送广播告诉 UI 我们正在劫持哪个应用 (限流 5 秒发一次，防卡顿)
                 val now = System.currentTimeMillis()
+                if (now - lastBroadcastTime > 5000) {
+                    val context = AndroidAppHelper.currentApplication()
+                    if (context != null) {
+                        val intent = Intent("com.hapticaudio.STATUS_UPDATE")
+                        intent.putExtra("pkg", lpparam.packageName)
+                        intent.setPackage("com.hapticaudio") // 定向发送
+                        context.sendBroadcast(intent)
+                    }
+                    lastBroadcastTime = now
+                }
+
+                // 2. 限流读取 UI 开关配置 (每 1 秒更新一次参数)
                 if (now - lastPrefReloadTime > 1000) {
                     pref.reload()
                     isMuted = pref.getBoolean("mute_speaker", true)
+                    AudioProcessor.intensity = pref.getInt("intensity", 100) / 100f
+                    // 将 1-100 的数值映射到算法系数
+                    AudioProcessor.lpfAlpha = pref.getInt("lpf_freq", 20) / 100f
+                    AudioProcessor.decayRate = (101 - pref.getInt("smoothing", 80)) / 100f
                     lastPrefReloadTime = now
                 }
 
-                // 核心黑科技：我们【绝不】破坏 param.args[0] 里的真实音乐数据。
-                // 我们直接在 AudioTrack 级别把扬声器音量调成 0。
-                // 这样底层的 HapticGenerator 能吃满音乐波形，而喇叭发不出任何声音。
+                // 3. 将原汁原味的数据【深拷贝】发给自研轮子
+                when (arrayType) {
+                    ByteArray::class.java -> AudioProcessor.pushAudioData((audioData as ByteArray).copyOfRange(offset, offset + size))
+                    ShortArray::class.java -> AudioProcessor.pushAudioData((audioData as ShortArray).copyOfRange(offset, offset + size))
+                    FloatArray::class.java -> AudioProcessor.pushAudioData((audioData as FloatArray).copyOfRange(offset, offset + size))
+                }
+
+                // 4. 【核心防漏音物理隔离】：如果开启静音，直接把发给硬件的内存数组全部填 0！
+                // 这比 setVolume 靠谱一万倍，一滴声音都进不去混音器。
                 if (isMuted) {
-                    try {
-                        track.setVolume(0f)
-                    } catch (e: Exception) {
-                        XposedBridge.log("HapticAudio 静音失败: ${e.message}")
+                    when (arrayType) {
+                        ByteArray::class.java -> (audioData as ByteArray).fill(0, offset, offset + size)
+                        ShortArray::class.java -> (audioData as ShortArray).fill(0, offset, offset + size)
+                        FloatArray::class.java -> (audioData as FloatArray).fill(0f, offset, offset + size)
                     }
                 }
             }
         }
 
-        // 统一拦截所有格式的 write 方法
         try {
             XposedHelpers.findAndHookMethod("android.media.AudioTrack", lpparam.classLoader, "write", ByteArray::class.java, Int::class.java, Int::class.java, Int::class.java, writeHook)
             XposedHelpers.findAndHookMethod("android.media.AudioTrack", lpparam.classLoader, "write", ShortArray::class.java, Int::class.java, Int::class.java, Int::class.java, writeHook)
@@ -87,21 +76,5 @@ class XposedEntry : IXposedHookLoadPackage {
         } catch (e: Exception) {
             XposedBridge.log("HapticAudio Hook 失败: ${e.message}")
         }
-
-        // 【钩子 3】：音乐结束时，优雅地释放特效引擎，防止底噪震动
-        XposedHelpers.findAndHookMethod(
-            "android.media.AudioTrack",
-            lpparam.classLoader,
-            "release",
-            object : XC_MethodHook() {
-                override fun beforeHookedMethod(param: MethodHookParam) {
-                    val track = param.thisObject as AudioTrack
-                    val generator = hapticGenerators.remove(track)
-                    try {
-                        generator?.release()
-                    } catch (e: Exception) {}
-                }
-            }
-        )
     }
 }
