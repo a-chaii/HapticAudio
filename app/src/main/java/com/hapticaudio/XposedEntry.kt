@@ -15,6 +15,7 @@ class XposedEntry : IXposedHookLoadPackage {
         if (lpparam.packageName == "android") return
 
         val pref = XSharedPreferences("com.hapticaudio", "haptic_config")
+        pref.makeWorldReadable()
 
         val hook = object : XC_MethodHook() {
             override fun beforeHookedMethod(param: MethodHookParam) {
@@ -23,14 +24,14 @@ class XposedEntry : IXposedHookLoadPackage {
                 val size = param.args[2] as Int
                 val arrayType = audioData.javaClass
 
-                // 1. 发送给流式处理器
+                // 1. 发送音频数据
                 when (arrayType) {
                     ByteArray::class.java -> AudioProcessor.pushAudioData((audioData as ByteArray).copyOfRange(offset, offset + size))
                     ShortArray::class.java -> AudioProcessor.pushAudioData((audioData as ShortArray).copyOfRange(offset, offset + size))
                     FloatArray::class.java -> AudioProcessor.pushAudioData((audioData as FloatArray).copyOfRange(offset, offset + size))
                 }
 
-                // 2. 限流读取 Web UI 的配置 (每1秒更新一次，防止 I/O 阻塞音频线程)
+                // 2. 限流刷新配置
                 val now = System.currentTimeMillis()
                 if (now - lastPrefReloadTime > 1000) {
                     pref.reload()
@@ -39,12 +40,12 @@ class XposedEntry : IXposedHookLoadPackage {
                     lastPrefReloadTime = now
                 }
 
-                // 3. 执行静音清零
+                // 3. 静音逻辑
                 if (isMuted) {
                     when (arrayType) {
                         ByteArray::class.java -> (audioData as ByteArray).fill(0, offset, offset + size)
                         ShortArray::class.java -> (audioData as ShortArray).fill(0, offset, offset + size)
-                        FloatArray::class.java -> (audioData as FloatArray).fill(0f, offset, offset + size)
+                        FloatArray::class.java -> (audioData as FloatArray).fill(0, offset, offset + size)
                     }
                 }
             }
