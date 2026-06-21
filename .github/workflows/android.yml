@@ -1,6 +1,5 @@
 name: Build HapticAudio Debug APK
 
-# 触发条件：当你推送到 main 分支，或者在网页端手动点击时触发
 on:
   push:
     branches: [ "main", "master" ]
@@ -19,18 +18,20 @@ jobs:
         with:
           java-version: '17'
           distribution: 'temurin'
-          cache: gradle
+          # 注意：这里删除了 cache: gradle，避免纯手搓无脚本时缓存报错
 
-      - name: 3. 赋予 gradlew 执行权限
+      - name: 3. 魔法：自动生成 Gradle Wrapper (补全缺失的执行文件)
+        run: gradle wrapper --gradle-version 8.5
+
+      - name: 4. 赋予 gradlew 执行权限
         run: chmod +x gradlew
 
-      - name: 4. 编译 Debug 版本 APK
+      - name: 5. 编译 Debug 版本 APK
         run: ./gradlew assembleDebug --no-daemon
 
-      - name: 5. 提取并上传 APK 产物
+      - name: 6. 提取并上传 APK 产物
         uses: actions/upload-artifact@v4
         with:
           name: HapticAudio-Debug-APK
-          # 提取 Debug 包的固定路径
           path: app/build/outputs/apk/debug/*.apk
           retention-days: 7
