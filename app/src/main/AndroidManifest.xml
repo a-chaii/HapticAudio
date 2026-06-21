@@ -3,6 +3,7 @@
     package="com.hapticaudio">
 
     <uses-permission android:name="android.permission.VIBRATE" />
+    <uses-permission android:name="android.permission.MODIFY_AUDIO_SETTINGS" />
 
     <application
         android:allowBackup="true"
@@ -10,15 +11,9 @@
         android:label="HapticAudio 触觉听歌"
         android:theme="@android:style/Theme.DeviceDefault">
         
-        <meta-data
-            android:name="xposedmodule"
-            android:value="true" />
-        <meta-data
-            android:name="xposeddescription"
-            android:value="抛弃Vibrator，使用底层的硬件 DSP 音频直通驱动 0916 Turbo 马达。" />
-        <meta-data
-            android:name="xposedminversion"
-            android:value="93" />
+        <meta-data android:name="xposedmodule" android:value="true" />
+        <meta-data android:name="xposeddescription" android:value="调用系统级 HapticGenerator，完美白嫖一加 O-Haptics 底层引擎。" />
+        <meta-data android:name="xposedminversion" android:value="93" />
 
         <activity android:name=".MainActivity" android:exported="true">
             <intent-filter>
