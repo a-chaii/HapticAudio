@@ -35,7 +35,7 @@ class XposedEntry : IXposedHookLoadPackage {
                 if (now - lastPrefReloadTime > 1000) {
                     pref.reload()
                     isMuted = pref.getBoolean("mute_speaker", true)
-                    AudioProcessor.intensityMultiplier = pref.getInt("intensity", 100) 100f / 100f
+                    AudioProcessor.intensityMultiplier = pref.getInt("intensity", 100f) / 100f
                     lastPrefReloadTime = now
                 }
 
@@ -44,7 +44,7 @@ class XposedEntry : IXposedHookLoadPackage {
                     when (arrayType) {
                         ByteArray::class.java -> (audioData as ByteArray).fill(0, offset, offset + size)
                         ShortArray::class.java -> (audioData as ShortArray).fill(0, offset, offset + size)
-                        FloatArray::class.java -> (audioData as FloatArray).fill(0, offset, offset + size)
+                        FloatArray::class.java -> (audioData as FloatArray).fill(0f, offset, offset + size)
                     }
                 }
             }
