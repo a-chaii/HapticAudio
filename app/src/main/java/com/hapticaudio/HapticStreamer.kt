@@ -4,33 +4,29 @@ import android.media.AudioAttributes
 import android.media.AudioFormat
 import android.media.AudioTrack
 
-/**
- * 硬件级音频转震动直通引擎
- */
 class HapticStreamer(val sampleRate: Int) {
     private var hapticTrack: AudioTrack? = null
-
-    // Android 9+ 隐藏的音频触觉通道 Flag
-    private val CHANNEL_OUT_HAPTIC_A = 0x20000000 
-
+    // 核心：0x20000000 是 Android 底层隐藏的 CHANNEL_OUT_HAPTIC_A
+    private val HAPTIC_CHANNEL_MASK = 0x20000000 
+    
     init {
         try {
-            // 构建一个双通道 (单声道扬声器 + 单声道马达) 的音频轨道
+            // 构建一个 包含立体声音频 + 单通道马达 的混合轨道
             val format = AudioFormat.Builder()
                 .setSampleRate(sampleRate)
                 .setEncoding(AudioFormat.ENCODING_PCM_16BIT)
-                .setChannelMask(AudioFormat.CHANNEL_OUT_MONO or CHANNEL_OUT_HAPTIC_A)
+                .setChannelMask(AudioFormat.CHANNEL_OUT_STEREO or HAPTIC_CHANNEL_MASK)
                 .build()
 
+            // 必须使用 USAGE_ALARM 或 ASSISTANCE_SONIFICATION 防止被系统的媒体静音策略拦截
             val attributes = AudioAttributes.Builder()
-                .setUsage(AudioAttributes.USAGE_MEDIA)
-                .setContentType(AudioAttributes.CONTENT_TYPE_MUSIC)
-                .setHapticChannelsMuted(false) // 强制允许音频触觉反馈
+                .setUsage(AudioAttributes.USAGE_ALARM) 
+                .setContentType(AudioAttributes.CONTENT_TYPE_SONIFICATION)
                 .build()
 
             val bufferSize = AudioTrack.getMinBufferSize(
                 sampleRate, 
-                AudioFormat.CHANNEL_OUT_MONO or CHANNEL_OUT_HAPTIC_A, 
+                AudioFormat.CHANNEL_OUT_STEREO or HAPTIC_CHANNEL_MASK, 
                 AudioFormat.ENCODING_PCM_16BIT
             )
 
@@ -38,47 +34,45 @@ class HapticStreamer(val sampleRate: Int) {
                 .setAudioAttributes(attributes)
                 .setAudioFormat(format)
                 .setTransferMode(AudioTrack.MODE_STREAM)
-                .setBufferSizeInBytes(bufferSize * 2)
+                .setBufferSizeInBytes(bufferSize)
                 .build()
 
             hapticTrack?.play()
         } catch (e: Exception) {
-            // 如果设备不支持，捕获异常防止崩溃
+            e.printStackTrace()
         }
     }
 
-    /**
-     * 将原始 PCM 声波混流并输送到马达 DSP
-     */
-    fun processAndWrite(originalData: ShortArray, offset: Int, size: Int, channelCount: Int, intensity: Float) {
+    // 接收劫持到的原始数据，注入马达通道
+    fun injectHapticData(originalShorts: ShortArray, intensity: Float) {
         if (hapticTrack == null) return
 
-        val frames = size / channelCount
-        // 分配新数组：扬声器轨道 + 马达轨道
-        val hapticBuffer = ShortArray(frames * 2)
+        // 假设原数据是双声道(Stereo)，我们要构造成 [左声道, 右声道, 马达通道] 的 3 通道数据
+        val frames = originalShorts.size / 2
+        val hapticBuffer = ShortArray(frames * 3)
 
         for (i in 0 until frames) {
-            // 混音提取单声道基准信号
-            var sum = 0
-            for (c in 0 until channelCount) {
-                sum += originalData[offset + i * channelCount + c]
-            }
-            val sample = (sum / channelCount)
+            // 提取双声道的平均值作为震动基准能量
+            val left = originalShorts[i * 2].toInt()
+            val right = originalShorts[i * 2 + 1].toInt()
+            val mixedSample = (left + right) / 2
+            
+            // 应用 UI 的增益倍率
+            val hapticSample = (mixedSample * intensity).toInt().coerceIn(-32768, 32767).toShort()
 
-            // 应用控制面板的增益倍率，并防止 PCM 溢出爆音
-            val hapticSample = (sample * intensity).toInt().coerceIn(-32768, 32767).toShort()
-
-            // 核心黑科技：左右声道分离复用
-            hapticBuffer[i * 2] = 0 // Channel 0 (Mono Speaker) -> 写入0，强制静音
-            hapticBuffer[i * 2 + 1] = hapticSample // Channel 1 (Haptic A Motor) -> 写入音频波形，马达按此波形震动！
+            // 核心黑科技：左右声道强行填 0（不发声），把音乐数据全塞进马达通道！
+            hapticBuffer[i * 3] = 0           // 左声道：静音
+            hapticBuffer[i * 3 + 1] = 0       // 右声道：静音
+            hapticBuffer[i * 3 + 2] = hapticSample // 马达通道：疯狂输出原音波形！
         }
 
-        // 直接冲入硬件 DSP
-        hapticTrack?.write(hapticBuffer, 0, frames * 2)
+        hapticTrack?.write(hapticBuffer, 0, hapticBuffer.size)
     }
 
     fun release() {
-        hapticTrack?.stop()
-        hapticTrack?.release()
+        try {
+            hapticTrack?.stop()
+            hapticTrack?.release()
+        } catch (e: Exception) {}
     }
 }
