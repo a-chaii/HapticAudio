@@ -35,7 +35,8 @@ class XposedEntry : IXposedHookLoadPackage {
                         val intent = Intent("com.hapticaudio.STATUS_UPDATE").apply {
                             putExtra("pkg", lpparam.packageName)
                             setPackage("com.hapticaudio")
-                            addFlags(Intent.FLAG_RECEIVER_INCLUDE_BACKGROUND)
+                            // 关键修复：用 0x01000000 代替 FLAG_RECEIVER_INCLUDE_BACKGROUND 绕过编译拦截
+                            addFlags(0x01000000) 
                         }
                         it.sendBroadcast(intent)
                     }
