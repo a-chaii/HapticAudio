@@ -7,11 +7,11 @@
     <application
         android:allowBackup="true"
         android:icon="@android:drawable/sym_def_app_icon"
-        android:label="HapticAudio 触觉控制"
+        android:label="HapticAudio 音乐共振"
         android:theme="@android:style/Theme.DeviceDefault.DayNight">
         
         <meta-data android:name="xposedmodule" android:value="true" />
-        <meta-data android:name="xposeddescription" android:value="修复版：纯净物理层静音 + 500ms无缝长波长引擎" />
+        <meta-data android:name="xposeddescription" android:value="M3莫奈版：15ms零延迟原声流共振引擎，支持超强动态对比度。" />
         <meta-data android:name="xposedminversion" android:value="93" />
 
         <activity android:name=".MainActivity" android:exported="true">
