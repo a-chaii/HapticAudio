@@ -1,7 +1,7 @@
 package com.hapticaudio
 
 import android.app.AndroidAppHelper
-import android.content.Intent
+import android.content.Context
 import de.robv.android.xposed.IXposedHookLoadPackage
 import de.robv.android.xposed.XC_MethodHook
 import de.robv.android.xposed.XposedBridge
@@ -12,7 +12,7 @@ import de.robv.android.xposed.callbacks.XC_LoadPackage
 class XposedEntry : IXposedHookLoadPackage {
     private var lastPrefReloadTime = 0L
     private var isMuted = true
-    private var lastBroadcastTime = 0L
+    private var isPkgRecorded = false
 
     override fun handleLoadPackage(lpparam: XC_LoadPackage.LoadPackageParam) {
         if (lpparam.packageName == "android") return
@@ -22,48 +22,41 @@ class XposedEntry : IXposedHookLoadPackage {
         val writeHook = object : XC_MethodHook() {
             override fun beforeHookedMethod(param: MethodHookParam) {
                 val audioData = param.args[0] ?: return
-                val offset = param.args[1] as Int
-                val size = param.args[2] as Int
                 val arrayType = audioData.javaClass
 
-                // 1. 发送广播告诉 UI 我们正在劫持哪个应用 (限流 5 秒发一次，防卡顿)
-                val now = System.currentTimeMillis()
-                if (now - lastBroadcastTime > 5000) {
+                // 1. 记录当前被劫持的包名给 UI 展示 (仅执行一次)
+                if (!isPkgRecorded) {
                     val context = AndroidAppHelper.currentApplication()
                     if (context != null) {
-                        val intent = Intent("com.hapticaudio.STATUS_UPDATE")
-                        intent.putExtra("pkg", lpparam.packageName)
-                        intent.setPackage("com.hapticaudio") // 定向发送
-                        context.sendBroadcast(intent)
+                        val hostPrefs = context.getSharedPreferences("haptic_config", Context.MODE_PRIVATE)
+                        hostPrefs.edit().putString("last_hooked_pkg", lpparam.packageName).apply()
+                        isPkgRecorded = true
                     }
-                    lastBroadcastTime = now
                 }
 
-                // 2. 限流读取 UI 开关配置 (每 1 秒更新一次参数)
+                // 2. 限流读取开关
+                val now = System.currentTimeMillis()
                 if (now - lastPrefReloadTime > 1000) {
                     pref.reload()
                     isMuted = pref.getBoolean("mute_speaker", true)
                     AudioProcessor.intensity = pref.getInt("intensity", 100) / 100f
-                    // 将 1-100 的数值映射到算法系数
-                    AudioProcessor.lpfAlpha = pref.getInt("lpf_freq", 20) / 100f
-                    AudioProcessor.decayRate = (101 - pref.getInt("smoothing", 80)) / 100f
+                    AudioProcessor.noiseGate = pref.getInt("noise_gate", 15)
                     lastPrefReloadTime = now
                 }
 
-                // 3. 将原汁原味的数据【深拷贝】发给自研轮子
+                // 3. 把原始数据丢进我们自研的长包缓冲引擎
                 when (arrayType) {
-                    ByteArray::class.java -> AudioProcessor.pushAudioData((audioData as ByteArray).copyOfRange(offset, offset + size))
-                    ShortArray::class.java -> AudioProcessor.pushAudioData((audioData as ShortArray).copyOfRange(offset, offset + size))
-                    FloatArray::class.java -> AudioProcessor.pushAudioData((audioData as FloatArray).copyOfRange(offset, offset + size))
+                    ByteArray::class.java -> AudioProcessor.pushAudioData((audioData as ByteArray).clone())
+                    ShortArray::class.java -> AudioProcessor.pushAudioData((audioData as ShortArray).clone())
+                    FloatArray::class.java -> AudioProcessor.pushAudioData((audioData as FloatArray).clone())
                 }
 
-                // 4. 【核心防漏音物理隔离】：如果开启静音，直接把发给硬件的内存数组全部填 0！
-                // 这比 setVolume 靠谱一万倍，一滴声音都进不去混音器。
+                // 4. 【终极物理静音】无论它传的是什么格式，当场清零，混音器根本拿不到波形
                 if (isMuted) {
                     when (arrayType) {
-                        ByteArray::class.java -> (audioData as ByteArray).fill(0, offset, offset + size)
-                        ShortArray::class.java -> (audioData as ShortArray).fill(0, offset, offset + size)
-                        FloatArray::class.java -> (audioData as FloatArray).fill(0f, offset, offset + size)
+                        ByteArray::class.java -> (audioData as ByteArray).fill(0)
+                        ShortArray::class.java -> (audioData as ShortArray).fill(0)
+                        FloatArray::class.java -> (audioData as FloatArray).fill(0f)
                     }
                 }
             }
