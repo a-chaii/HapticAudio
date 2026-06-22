@@ -7,73 +7,82 @@ import android.os.Build
 import android.os.VibrationEffect
 import android.os.Vibrator
 import android.os.VibratorManager
-import kotlinx.coroutines.*
-import kotlinx.coroutines.channels.BufferOverflow
-import kotlinx.coroutines.channels.Channel
-import kotlin.math.log10
+import java.util.concurrent.Executors
+import java.util.concurrent.LinkedBlockingQueue
 import kotlin.math.sqrt
 
 object AudioProcessor {
-    // 动态调音参数
     var intensity = 1.0f
-    var lpfAlpha = 0.2f
-    var decayRate = 0.2f
+    var noiseGate = 15
 
-    private val audioChannel = Channel<Any>(capacity = 50, onBufferOverflow = BufferOverflow.DROP_OLDEST)
-    private val processorScope = CoroutineScope(Dispatchers.Default + SupervisorJob())
+    // 禁用 Kotlin 协程，改用原生 Java 并发队列，杜绝宿主缺少协程库导致的闪退/失效
+    private val audioQueue = LinkedBlockingQueue<Any>(100)
+    private val executor = Executors.newSingleThreadExecutor()
 
     private var vibrator: Vibrator? = null
     private var isInitialized = false
 
-    // 无缝波形拼接器：每次积攒 5 帧（每帧 10ms），合并成一个 50ms 的长波形发给马达
-    private const val SAMPLES_PER_FRAME = 441 // 约 10ms (假设44.1kHz采样率)
-    private const val BATCH_SIZE = 5          // 50ms 批处理
+    // === 超长波形打包器 ===
+    // 我们将把碎音频打包成 500 毫秒的超长连续波形
+    // 500ms 切分成 25 块，每块 20ms
+    private const val BATCH_CHUNKS = 25 
+    private const val SAMPLES_PER_CHUNK = 882 // 约 20ms 的采样数 (44.1kHz)
     
-    private val timings = LongArray(BATCH_SIZE) { 10L }
-    private val amplitudes = IntArray(BATCH_SIZE)
-    private var batchIndex = 0
+    // 生成系统需要的连续震动长数组
+    private val timings = LongArray(BATCH_CHUNKS) { 20L } 
+    private val amplitudes = IntArray(BATCH_CHUNKS)
+    private var currentChunkIndex = 0
 
     private var currentFrameEnergy = 0.0
     private var currentFrameSamples = 0
-    private var lastFilteredSample = 0.0f
     private var currentEnvelope = 0.0f
 
     init {
-        startProcessing()
+        startProcessingThread()
     }
 
     fun pushAudioData(data: Any) {
-        audioChannel.trySend(data)
+        // 防止队列积压造成内存泄漏
+        if (audioQueue.size > 80) audioQueue.poll()
+        audioQueue.offer(data)
     }
 
     @SuppressLint("ServiceCast")
     private fun initVibratorIfNeeded() {
         if (isInitialized) return
         val context = AndroidAppHelper.currentApplication()?.applicationContext ?: return
-        vibrator = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.S) {
-            (context.getSystemService(Context.VIBRATOR_MANAGER_SERVICE) as VibratorManager).defaultVibrator
-        } else {
-            context.getSystemService(Context.VIBRATOR_SERVICE) as Vibrator
+        try {
+            vibrator = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.S) {
+                (context.getSystemService(Context.VIBRATOR_MANAGER_SERVICE) as VibratorManager).defaultVibrator
+            } else {
+                context.getSystemService(Context.VIBRATOR_SERVICE) as Vibrator
+            }
+            isInitialized = true
+        } catch (e: Exception) {
+            // 防止部分 App 没有震动权限导致崩溃
         }
-        isInitialized = true
     }
 
-    private fun startProcessing() {
-        processorScope.launch {
-            for (data in audioChannel) {
-                processAudioChunk(data)
+    private fun startProcessingThread() {
+        executor.execute {
+            while (true) {
+                try {
+                    val data = audioQueue.take() // 阻塞直到有音频数据进来
+                    processChunk(data)
+                } catch (e: Exception) {
+                    e.printStackTrace()
+                }
             }
         }
     }
 
-    private fun processAudioChunk(data: Any) {
+    private fun processChunk(data: Any) {
         when (data) {
             is ByteArray -> {
                 val size = data.size - 1
                 for (i in 0 until size step 2) {
                     val sample = (data[i].toInt() and 0xFF) or (data[i + 1].toInt() shl 8)
-                    val signedSample = (if (sample > 32767) sample - 65536 else sample).toFloat()
-                    accumulateSample(signedSample)
+                    accumulateSample((if (sample > 32767) sample - 65536 else sample).toFloat())
                 }
             }
             is ShortArray -> {
@@ -86,57 +95,54 @@ object AudioProcessor {
     }
 
     private fun accumulateSample(sample: Float) {
-        // 1. 低通滤波器 (干掉刺耳高频，保留浑厚质感)
-        lastFilteredSample = lpfAlpha * sample + (1f - lpfAlpha) * lastFilteredSample
-        
-        currentFrameEnergy += lastFilteredSample * lastFilteredSample
+        currentFrameEnergy += (sample * sample)
         currentFrameSamples++
 
-        // 当积攒够 10ms 的数据时
-        if (currentFrameSamples >= SAMPLES_PER_FRAME) {
-            val rms = sqrt(currentFrameEnergy / SAMPLES_PER_FRAME)
-            amplitudes[batchIndex] = mapRmsToAmplitude(rms)
-            batchIndex++
+        // 积攒够 20ms 的数据，就算作波形数组中的 1 个点
+        if (currentFrameSamples >= SAMPLES_PER_CHUNK) {
+            val rms = sqrt(currentFrameEnergy / SAMPLES_PER_CHUNK)
+            
+            // 能量映射 (简单粗暴提取包络)
+            val normalized = (rms / 32768.0).coerceIn(0.0, 1.0).toFloat()
+            
+            // 包络粘合处理 (缓解哒哒声的关键：衰减不许太快)
+            if (normalized > currentEnvelope) {
+                currentEnvelope += 0.5f * (normalized - currentEnvelope)
+            } else {
+                currentEnvelope += 0.2f * (normalized - currentEnvelope)
+            }
+
+            // 计算最终给马达的推力
+            var finalAmp = (currentEnvelope * 255 * intensity).toInt().coerceIn(0, 255)
+            if (finalAmp < noiseGate) finalAmp = 0 // 干掉烦人的底噪
+            
+            amplitudes[currentChunkIndex] = finalAmp
+            currentChunkIndex++
 
             currentFrameEnergy = 0.0
             currentFrameSamples = 0
 
-            // 2. 当波形数组填满 50ms 时，统一发射给硬件！
-            if (batchIndex >= BATCH_SIZE) {
-                fireWaveform(amplitudes.clone())
-                batchIndex = 0
+            // 【核心爆发点】积攒够 500ms（25个点），将这半秒的长波一次性轰入底层！
+            if (currentChunkIndex >= BATCH_CHUNKS) {
+                fireBatchWaveform()
+                currentChunkIndex = 0
             }
         }
     }
 
-    private fun mapRmsToAmplitude(rms: Double): Int {
-        val normalized = (rms / 32768.0).coerceIn(0.0001, 1.0)
-        val dbValue = 20.0 * log10(normalized)
-        
-        // 动态范围映射门限
-        val targetIntensity = ((dbValue + 45.0) / 45.0).coerceIn(0.0, 1.0).toFloat()
-
-        // 包络追踪器：Attack 极快(跟手)，Decay 受 UI 滑块控制(决定粘合度)
-        if (targetIntensity > currentEnvelope) {
-            currentEnvelope += 0.8f * (targetIntensity - currentEnvelope) // 秒起
-        } else {
-            currentEnvelope += decayRate * (targetIntensity - currentEnvelope) // 缓慢释放粘合
-        }
-
-        val finalAmp = (currentEnvelope * 255 * intensity).toInt().coerceIn(0, 255)
-        return if (finalAmp > 5) finalAmp else 0 // 过滤底噪死区
-    }
-
-    private fun fireWaveform(amps: IntArray) {
+    private fun fireBatchWaveform() {
         initVibratorIfNeeded()
         if (vibrator?.hasVibrator() != true) return
         
         if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
             try {
-                // -1 代表不循环，播放一遍这 50ms 的波形
-                val effect = VibrationEffect.createWaveform(timings, amps, -1)
+                // 生成一个持续 500 毫秒、连绵起伏的波浪，马达绝对不会断触急刹车
+                val effect = VibrationEffect.createWaveform(timings, amplitudes, -1)
                 vibrator?.vibrate(effect)
-            } catch (e: Exception) { }
+            } catch (e: Exception) {
+                // 如果目标应用因为没有 <uses-permission VIBRATE> 权限被系统拒绝
+                e.printStackTrace()
+            }
         }
     }
 }
