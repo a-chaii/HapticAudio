@@ -23,8 +23,6 @@ object AudioProcessor {
     private var isInitialized = false
 
     // === 零滤除高速时域打包器 ===
-    // 为了让马达完美复刻音乐振幅的高低起伏，拒绝打点感。
-    // 我们将打包长度缩减到 120ms 的超短滑窗，内部切分成 8 个极速采样点（每点 15ms）
     private const val BATCH_POINTS = 8
     private const val SAMPLES_PER_POINT = 661 // 44.1kHz 下约 15ms 的采样数量
 
@@ -82,18 +80,15 @@ object AudioProcessor {
     }
 
     private fun feedSample(sample: Float) {
-        // 完全无滤波器！直接提取最原始的物理能量
         accumulatedEnergy += (sample * sample)
         accumulatedSamples++
 
-        // 积攒满 15ms 的原声数据
-        if (accumulatedSamples >= SAMPLES_PER_CHUNK) {
-            val rms = sqrt(accumulatedEnergy / SAMPLES_PER_CHUNK)
+        // 关键修复点：替换为正确的常量名 SAMPLES_PER_POINT
+        if (accumulatedSamples >= SAMPLES_PER_POINT) {
+            val rms = sqrt(accumulatedEnergy / SAMPLES_PER_POINT)
             val normalized = (rms / 32768.0).coerceIn(0.0, 1.0)
 
-            // 【核心算法更新：动态范围爆发扩张】
-            // 之前强度变化小，是因为进行了线性映射。现在我们改用 1.5 次方指数扩张！
-            // 这会让弱音迅速跌落至接近静音，强音（如鼓点、高潮）呈现爆发性极强推力！
+            // 指数范围扩张映射
             val expandedEnvelope = normalized.pow(1.5)
 
             var amp = (expandedEnvelope * 255 * intensity).toInt().coerceIn(0, 255)
@@ -105,7 +100,6 @@ object AudioProcessor {
             accumulatedEnergy = 0.0
             accumulatedSamples = 0
 
-            // 攒满 8 个点（总计 120ms 连续波形），直接轰入底层马达抽象层
             if (currentPointIndex >= BATCH_POINTS) {
                 commitHapticWaveform()
                 currentPointIndex = 0
@@ -119,7 +113,6 @@ object AudioProcessor {
 
         if (vibrator?.hasVibrator() == true && Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
             try {
-                // 120ms 的超短不循环长波，更新频率极快，跟随音乐旋律起伏变化
                 val effect = VibrationEffect.createWaveform(timings, amplitudes, -1)
                 vibrator?.vibrate(effect)
             } catch (e: Exception) { e.printStackTrace() }
